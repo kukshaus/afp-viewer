@@ -3,8 +3,10 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useAfpViewerStore } from '@/store/afpViewerStore';
 import { useAfpViewer } from '@/hooks/useAfpViewer';
-import { Loader2, Copy, Check } from 'lucide-react';
+import { Loader2, Copy, Check, Trash2, Save, CheckSquare, Square } from 'lucide-react';
 import type { PageRenderTree } from '@/lib/afp/types';
+import { reassembleAfp } from '@/lib/afp/afp-page-manager';
+import { downloadBlob } from '@/lib/afp/afp-cutter';
 
 const RENDER_DPI = 150;
 const RESOLUTION = 1440;
@@ -266,6 +268,9 @@ export function PageCanvas() {
         </div>
       )}
 
+      {/* Page edit floating bar */}
+      <PageEditBar />
+
       {renderError && !isPageLoading && (
         <div className="flex flex-col items-center gap-2 text-center">
           <p className="text-sm font-medium text-[hsl(var(--destructive))]">Render Error</p>
@@ -424,4 +429,125 @@ function buildHighlights(
   }
 
   return highlights;
+}
+
+/** Floating action bar for the current page when page edit mode is active. */
+function PageEditBar() {
+  const pageEditMode = useAfpViewerStore((s) => s.pageEditMode);
+  const selectedPages = useAfpViewerStore((s) => s.selectedPages);
+  const currentPage = useAfpViewerStore((s) => s.currentPage);
+  const totalPages = useAfpViewerStore((s) => s.pageIndex).length;
+  const fileData = useAfpViewerStore((s) => s.fileData);
+  const pageIndex = useAfpViewerStore((s) => s.pageIndex);
+  const fileName = useAfpViewerStore((s) => s.fileName);
+
+  if (!pageEditMode || !fileData || totalPages === 0) return null;
+
+  const isSelected = selectedPages.has(currentPage);
+
+  const toggleCurrent = () => {
+    const next = new Set(selectedPages);
+    if (next.has(currentPage)) next.delete(currentPage);
+    else next.add(currentPage);
+    useAfpViewerStore.setState({ selectedPages: next });
+  };
+
+  const deleteCurrent = () => {
+    const keepOrder: number[] = [];
+    for (let i = 0; i < pageIndex.length; i++) {
+      if (i + 1 !== currentPage) keepOrder.push(i);
+    }
+    if (keepOrder.length === 0) return;
+    const blob = reassembleAfp(fileData, pageIndex, keepOrder);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_edited.afp`);
+  };
+
+  const extractCurrent = () => {
+    const blob = reassembleAfp(fileData, pageIndex, [currentPage - 1]);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_page${currentPage}.afp`);
+  };
+
+  const deleteSelected = () => {
+    if (selectedPages.size === 0) return;
+    const keepOrder: number[] = [];
+    for (let i = 0; i < pageIndex.length; i++) {
+      if (!selectedPages.has(i + 1)) keepOrder.push(i);
+    }
+    if (keepOrder.length === 0) return;
+    const blob = reassembleAfp(fileData, pageIndex, keepOrder);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_edited.afp`);
+  };
+
+  const extractSelected = () => {
+    if (selectedPages.size === 0) return;
+    const order = Array.from(selectedPages).sort((a, b) => a - b).map((p) => p - 1);
+    const blob = reassembleAfp(fileData, pageIndex, order);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_extracted.afp`);
+  };
+
+  return (
+    <div className="absolute left-1/2 top-3 z-20 -translate-x-1/2">
+      <div className="flex items-center gap-1 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--card))] px-2 py-1.5 shadow-lg">
+        {/* Toggle select current page */}
+        <button
+          onClick={toggleCurrent}
+          className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors ${
+            isSelected
+              ? 'bg-[hsl(var(--primary))]/15 text-[hsl(var(--primary))]'
+              : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]'
+          }`}
+          title={isSelected ? 'Deselect this page' : 'Select this page'}
+        >
+          {isSelected ? <CheckSquare className="h-3.5 w-3.5" /> : <Square className="h-3.5 w-3.5" />}
+          Page {currentPage}
+        </button>
+
+        <div className="mx-1 h-4 w-px bg-[hsl(var(--border))]" />
+
+        {/* Current page actions */}
+        <button
+          onClick={extractCurrent}
+          className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]"
+          title="Extract this page as AFP"
+        >
+          <Save className="h-3.5 w-3.5" /> Extract
+        </button>
+        <button
+          onClick={deleteCurrent}
+          className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-[hsl(var(--destructive))] hover:bg-[hsl(var(--accent))]"
+          title="Download document without this page"
+        >
+          <Trash2 className="h-3.5 w-3.5" /> Remove
+        </button>
+
+        {/* Batch actions when pages are selected */}
+        {selectedPages.size > 0 && (
+          <>
+            <div className="mx-1 h-4 w-px bg-[hsl(var(--border))]" />
+            <span className="text-[10px] font-medium text-[hsl(var(--primary))]">
+              {selectedPages.size} sel.
+            </span>
+            <button
+              onClick={extractSelected}
+              className="flex items-center gap-1 rounded bg-[hsl(var(--primary))] px-2 py-1 text-[11px] font-medium text-[hsl(var(--primary-foreground))] hover:opacity-90"
+              title="Extract all selected pages"
+            >
+              <Save className="h-3 w-3" />
+            </button>
+            <button
+              onClick={deleteSelected}
+              className="flex items-center gap-1 rounded bg-[hsl(var(--destructive))] px-2 py-1 text-[11px] font-medium text-white hover:opacity-90"
+              title="Remove all selected pages"
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
 }
