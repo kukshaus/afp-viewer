@@ -40,6 +40,7 @@ export interface AfpViewerState {
   diagnosticsOpen: boolean;
   docInfoOpen: boolean;
   exportOpen: boolean;
+  splitOpen: boolean;
 
   // Settings
   showEndTags: boolean;
@@ -117,6 +118,7 @@ const initialState = {
   diagnosticsOpen: false,
   docInfoOpen: false,
   exportOpen: false,
+  splitOpen: false,
   showEndTags: false,
   showPlaceholders: true,
   docDividerTle: '' as string,

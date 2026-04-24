@@ -3,7 +3,7 @@
 import { useRef, useCallback } from 'react';
 import { useAfpViewerStore } from '@/store/afpViewerStore';
 import { useAfpViewer } from '@/hooks/useAfpViewer';
-import { Menu, Search, Upload, X, MousePointer2, List, FileWarning, Info, Download } from 'lucide-react';
+import { Menu, Search, Upload, X, MousePointer2, List, FileWarning, Info, Download, Scissors } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Separator } from '@/components/ui/separator';
@@ -144,6 +144,16 @@ export function Header({ onFileLoad }: HeaderProps) {
           disabled={!fileName}
         >
           <Download className="h-4 w-4" />
+        </Button>
+
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => useAfpViewerStore.setState((s) => ({ splitOpen: !s.splitOpen }))}
+          aria-label="Split document"
+          disabled={!fileName}
+        >
+          <Scissors className="h-4 w-4" />
         </Button>
 
         <Button

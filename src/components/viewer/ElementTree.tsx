@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { useAfpViewer } from '@/hooks/useAfpViewer';
 import { useAfpViewerStore } from '@/store/afpViewerStore';
 import {
@@ -300,17 +301,38 @@ function IconForType({ type }: { type: string }) {
   }
 }
 
-const MAX_TREE_NODES = 50000; // Cap to avoid freezing on huge files
+interface ParseState {
+  offset: number;
+  id: number;
+  stack: TreeNode[];
+  done: boolean;
+  totalParsed: number;
+}
 
-function buildTree(buffer: ArrayBuffer): TreeNode[] {
+const INITIAL_CHUNK = 50000; // First chunk — instant display
+const BG_CHUNK = 20000;      // Background chunks — progressive loading
+
+/**
+ * Parse AFP structured fields into tree nodes, up to `maxItems` at a time.
+ * Supports incremental parsing: pass the returned state back to continue.
+ * `rootNodes` is mutated in place — new top-level nodes are pushed to it.
+ * `baseDepth` offsets the depth (use 1 when wrapping in a root node).
+ */
+function buildTreeChunk(
+  buffer: ArrayBuffer,
+  rootNodes: TreeNode[],
+  state: ParseState | null,
+  maxItems: number,
+  baseDepth: number = 0,
+): ParseState {
   const view = new DataView(buffer);
-  const nodes: TreeNode[] = [];
-  const stack: TreeNode[] = [];
-  let offset = 0;
-  let id = 0;
+  let offset = state?.offset ?? 0;
+  let id = state?.id ?? 0;
+  const stack: TreeNode[] = state?.stack ? [...state.stack] : [];
+  let totalParsed = state?.totalParsed ?? 0;
+  let count = 0;
 
-  while (offset < buffer.byteLength) {
-    if (id >= MAX_TREE_NODES) break;
+  while (offset < buffer.byteLength && count < maxItems) {
     if (view.getUint8(offset) !== 0x5A) { offset++; continue; }
     if (offset + 9 > buffer.byteLength) break;
 
@@ -339,43 +361,46 @@ function buildTree(buffer: ArrayBuffer): TreeNode[] {
       length,
       dataPreview: getDataPreview(data, typeId),
       children: [],
-      depth: stack.length,
+      depth: stack.length + baseDepth,
       icon: getIconType(typeId),
     };
 
     if (isEndType(typeId)) {
-      // Pop from stack — add as sibling at the parent level
-      if (stack.length > 0) {
-        stack.pop();
-      }
+      if (stack.length > 0) stack.pop();
       if (stack.length > 0) {
         stack[stack.length - 1].children.push(node);
       } else {
-        nodes.push(node);
+        rootNodes.push(node);
       }
     } else if (isBeginType(typeId)) {
-      // Push onto stack as new parent
       if (stack.length > 0) {
         stack[stack.length - 1].children.push(node);
       } else {
-        nodes.push(node);
+        rootNodes.push(node);
       }
       stack.push(node);
     } else {
-      // Data/descriptor field — add as child of current parent
       if (stack.length > 0) {
         stack[stack.length - 1].children.push(node);
       } else {
-        nodes.push(node);
+        rootNodes.push(node);
       }
     }
 
     const nextOffset = offset + 1 + length;
     if (nextOffset <= offset) break;
     offset = nextOffset;
+    count++;
+    totalParsed++;
   }
 
-  return nodes;
+  return {
+    offset,
+    id,
+    stack,
+    done: offset >= buffer.byteLength,
+    totalParsed,
+  };
 }
 
 /** Collect all nodes in DFS order for search, pre-computing search text. */
@@ -456,95 +481,88 @@ function exportElementAsAfp(node: TreeNode, fileData: ArrayBuffer): void {
   URL.revokeObjectURL(url);
 }
 
-function TreeNodeRow({
+/** Build a flat list of visible rows from the tree, respecting expanded state and showEndTags. */
+function buildVisibleRows(
+  roots: TreeNode[],
+  expandedIds: Set<string>,
+  showEndTags: boolean,
+): TreeNode[] {
+  const rows: TreeNode[] = [];
+  function walk(nodes: TreeNode[]) {
+    for (const node of nodes) {
+      if (!showEndTags && isEndType(node.typeId)) continue;
+      rows.push(node);
+      if (node.children.length > 0 && expandedIds.has(node.id)) {
+        walk(node.children);
+      }
+    }
+  }
+  walk(roots);
+  return rows;
+}
+
+function FlatTreeRow({
   node,
-  selectedId,
-  matchIds,
-  expandedIds,
+  isSelected,
+  isMatch,
+  isExpanded,
+  hasChildren,
   onToggle,
   onSelect,
 }: {
   node: TreeNode;
-  selectedId: string | null;
-  matchIds: Set<string>;
-  expandedIds: Set<string>;
+  isSelected: boolean;
+  isMatch: boolean;
+  isExpanded: boolean;
+  hasChildren: boolean;
   onToggle: (id: string) => void;
   onSelect: (node: TreeNode) => void;
 }) {
-  const showEndTags = useAfpViewerStore((s) => s.showEndTags);
-  const isEnd = isEndType(node.typeId);
-
-  // Skip END tags if setting is off
-  if (isEnd && !showEndTags) return null;
-
-  const hasChildren = node.children.length > 0;
-  const isExpanded = expandedIds.has(node.id);
-  const isSelected = selectedId === node.id;
-  const isMatch = matchIds.has(node.id);
-
   return (
-    <>
-      <button
-        data-element-id={node.id}
-        onClick={() => {
-          onSelect(node);
-          if (hasChildren) onToggle(node.id);
-        }}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          onSelect(node);
-          // Export this element as AFP
-          const fileData = useAfpViewerStore.getState().fileData;
-          if (!fileData) return;
-          exportElementAsAfp(node, fileData);
-        }}
-        className={`flex w-full items-center gap-1 px-2 py-1 text-left text-xs transition-colors hover:bg-[hsl(var(--accent))] ${
-          isSelected
-            ? 'bg-[hsl(var(--primary))]/15 ring-1 ring-inset ring-[hsl(var(--primary))]'
-            : isMatch
-              ? 'bg-yellow-100 dark:bg-yellow-900/30'
-              : ''
-        }`}
-        style={{ paddingLeft: `${node.depth * 16 + 8}px` }}
-      >
-        {hasChildren ? (
-          isExpanded ? (
-            <ChevronDown className="h-3 w-3 shrink-0 text-[hsl(var(--muted-foreground))]" />
-          ) : (
-            <ChevronRight className="h-3 w-3 shrink-0 text-[hsl(var(--muted-foreground))]" />
-          )
+    <button
+      data-element-id={node.id}
+      onClick={() => {
+        onSelect(node);
+        if (hasChildren) onToggle(node.id);
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onSelect(node);
+        const fileData = useAfpViewerStore.getState().fileData;
+        if (!fileData) return;
+        exportElementAsAfp(node, fileData);
+      }}
+      className={`flex w-full items-center gap-1 px-2 py-1 text-left text-xs transition-colors hover:bg-[hsl(var(--accent))] ${
+        isSelected
+          ? 'bg-[hsl(var(--primary))]/15 ring-1 ring-inset ring-[hsl(var(--primary))]'
+          : isMatch
+            ? 'bg-yellow-100 dark:bg-yellow-900/30'
+            : ''
+      }`}
+      style={{ paddingLeft: `${node.depth * 16 + 8}px` }}
+    >
+      {hasChildren ? (
+        isExpanded ? (
+          <ChevronDown className="h-3 w-3 shrink-0 text-[hsl(var(--muted-foreground))]" />
         ) : (
-          <span className="w-3 shrink-0" />
-        )}
-        <IconForType type={node.icon} />
-        <span className={`shrink-0 font-medium ${isMatch ? 'text-yellow-700 dark:text-yellow-300' : ''}`}>
-          {node.abbrev}
-        </span>
-        {node.dataPreview && (
-          <span className="truncate text-[10px] text-[hsl(var(--muted-foreground))]">
-            {node.dataPreview.length > 25 ? node.dataPreview.slice(0, 25) + '..' : node.dataPreview}
-          </span>
-        )}
-        <span className="ml-auto shrink-0 font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
-          @{node.offset}
-        </span>
-      </button>
-      {hasChildren && isExpanded && (
-        <>
-          {node.children.map((child) => (
-            <TreeNodeRow
-              key={child.id}
-              node={child}
-              selectedId={selectedId}
-              matchIds={matchIds}
-              expandedIds={expandedIds}
-              onToggle={onToggle}
-              onSelect={onSelect}
-            />
-          ))}
-        </>
+          <ChevronRight className="h-3 w-3 shrink-0 text-[hsl(var(--muted-foreground))]" />
+        )
+      ) : (
+        <span className="w-3 shrink-0" />
       )}
-    </>
+      <IconForType type={node.icon} />
+      <span className={`shrink-0 font-medium ${isMatch ? 'text-yellow-700 dark:text-yellow-300' : ''}`}>
+        {node.abbrev}
+      </span>
+      {node.dataPreview && (
+        <span className="truncate text-[10px] text-[hsl(var(--muted-foreground))]">
+          {node.dataPreview.length > 25 ? node.dataPreview.slice(0, 25) + '..' : node.dataPreview}
+        </span>
+      )}
+      <span className="ml-auto shrink-0 font-mono text-[10px] text-[hsl(var(--muted-foreground))]">
+        @{node.offset}
+      </span>
+    </button>
   );
 }
 
@@ -571,89 +589,209 @@ export function ElementTree() {
   const [matchList, setMatchList] = useState<TreeNode[]>([]);
   const [matchIndex, setMatchIndex] = useState(-1);
 
-  // Build tree from the full file (once)
-  useEffect(() => {
-    if (status !== 'ready' || !fileData || fileData.byteLength === 0) {
-      setTree([]);
-      setAllFlat([]);
-      setParentMap(new Map());
-      return;
-    }
-    const childNodes = buildTree(fileData);
+  // Progressive loading state
+  const parseStateRef = useRef<ParseState | null>(null);
+  const childNodesRef = useRef<TreeNode[]>([]);
+  const bgTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [loadedCount, setLoadedCount] = useState(0);
+  const [parseDone, setParseDone] = useState(true);
+  const fileDataRef = useRef(fileData);
+  fileDataRef.current = fileData;
 
-    // Wrap all nodes under a root file node
+  // Helper: create root wrapper and update all derived state
+  const updateTreeState = useCallback((): { flat: TreeNode[]; pMap: Map<string, string> } => {
+    const fd = fileDataRef.current;
+    const fn = useAfpViewerStore.getState().fileName;
+    const size = fd?.byteLength ?? 0;
+
     const rootNode: TreeNode = {
       id: 'sf-root',
       typeId: 'ROOT',
-      abbrev: fileName || 'AFP File',
-      fullName: `AFP Document (${(fileData.byteLength / 1024).toFixed(1)} KB)`,
+      abbrev: fn || 'AFP File',
+      fullName: `AFP Document (${(size / 1024).toFixed(1)} KB)`,
       offset: 0,
-      length: fileData.byteLength,
+      length: size,
       dataPreview: '',
-      children: childNodes,
+      children: childNodesRef.current,
       depth: 0,
       icon: 'database',
     };
 
-    // Increment depth of all children
-    function addDepth(nodes: TreeNode[], inc: number) {
-      for (const n of nodes) {
-        n.depth += inc;
-        addDepth(n.children, inc);
+    const newTree = [rootNode];
+    const flat = flattenTree(newTree);
+    const pMap = buildParentMap(newTree);
+
+    setTree(newTree);
+    setAllFlat(flat);
+    setParentMap(pMap);
+    setLoadedCount(parseStateRef.current?.totalParsed ?? 0);
+    setParseDone(parseStateRef.current?.done ?? true);
+
+    return { flat, pMap };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Helper: schedule background chunk loading
+  const scheduleBackground = useCallback(() => {
+    if (bgTimerRef.current) clearTimeout(bgTimerRef.current);
+
+    const loadNextChunk = () => {
+      const ps = parseStateRef.current;
+      const fd = fileDataRef.current;
+      if (!ps || ps.done || !fd) {
+        setParseDone(true);
+        return;
       }
+
+      const newState = buildTreeChunk(fd, childNodesRef.current, ps, BG_CHUNK, 1);
+      parseStateRef.current = newState;
+      updateTreeState();
+
+      if (!newState.done) {
+        bgTimerRef.current = setTimeout(loadNextChunk, 100);
+      }
+    };
+
+    bgTimerRef.current = setTimeout(loadNextChunk, 100);
+  }, [updateTreeState]);
+
+  // Helper: parse ahead to a specific byte offset (for page navigation)
+  const parseUntilOffset = useCallback((targetOffset: number): { flat: TreeNode[]; pMap: Map<string, string> } | null => {
+    const ps = parseStateRef.current;
+    const fd = fileDataRef.current;
+    if (!ps || ps.done || !fd || ps.offset > targetOffset) return null;
+
+    // Cancel background loading while we parse ahead
+    if (bgTimerRef.current) {
+      clearTimeout(bgTimerRef.current);
+      bgTimerRef.current = null;
     }
-    addDepth(childNodes, 1);
 
-    const nodes = [rootNode];
-    setTree(nodes);
-    setAllFlat(flattenTree(nodes));
-    setParentMap(buildParentMap(nodes));
+    // Parse in chunks until we pass the target offset
+    let state = ps;
+    while (!state.done && state.offset <= targetOffset) {
+      state = buildTreeChunk(fd, childNodesRef.current, state, BG_CHUNK, 1);
+    }
+    parseStateRef.current = state;
+
+    const result = updateTreeState();
+
+    // Resume background loading if not done
+    if (!state.done) {
+      scheduleBackground();
+    }
+
+    return result;
+  }, [updateTreeState, scheduleBackground]);
+
+  // Build tree from file (initial chunk + background progressive loading)
+  useEffect(() => {
+    // Cancel any previous background loading
+    if (bgTimerRef.current) {
+      clearTimeout(bgTimerRef.current);
+      bgTimerRef.current = null;
+    }
+
+    if (status !== 'ready' || !fileData || fileData.byteLength === 0) {
+      setTree([]);
+      setAllFlat([]);
+      setParentMap(new Map());
+      parseStateRef.current = null;
+      childNodesRef.current = [];
+      setLoadedCount(0);
+      setParseDone(true);
+      return;
+    }
+
+    // Parse first chunk synchronously for instant display
+    const childNodes: TreeNode[] = [];
+    const state = buildTreeChunk(fileData, childNodes, null, INITIAL_CHUNK, 1);
+    childNodesRef.current = childNodes;
+    parseStateRef.current = state;
+
+    updateTreeState();
     setExpandedIds(new Set(['sf-root']));
-  }, [fileData, status]);
 
-  // When page changes, find and select the matching BRS node, expand its ancestors
+    // Continue loading the rest in the background
+    if (!state.done) {
+      scheduleBackground();
+    }
+
+    return () => {
+      if (bgTimerRef.current) {
+        clearTimeout(bgTimerRef.current);
+        bgTimerRef.current = null;
+      }
+    };
+  }, [fileData, status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When page changes, find and select the matching BPG node, expand its ancestors
   useEffect(() => {
     if (!allFlat.length || !pageIndex.length || currentPage < 1) return;
     const entry = pageIndex[currentPage - 1];
     if (!entry) return;
 
+    let flat = allFlat;
+    let pMap = parentMap;
+
     // Find the node at this page's byte offset
-    const pageNode = allFlat.find((n) => n.offset === entry.byteOffset);
+    let pageNode = flat.find((n) => n.offset === entry.byteOffset);
+
+    // If not found, the page is beyond the parsed range — parse ahead
+    if (!pageNode) {
+      const result = parseUntilOffset(entry.byteOffset);
+      if (result) {
+        flat = result.flat;
+        pMap = result.pMap;
+        pageNode = flat.find((n) => n.offset === entry.byteOffset);
+      }
+    }
+
     if (pageNode) {
       setSelectedElementId(pageNode.id);
       setSelectedNode(pageNode);
 
       // Expand ancestors
-      const ancestors = getAncestorIds(parentMap, pageNode.id);
+      const ancestors = getAncestorIds(pMap, pageNode.id);
       setExpandedIds((prev) => {
         const next = new Set(prev);
         for (const a of ancestors) next.add(a);
-        next.add(pageNode.id); // expand the page node itself
+        next.add(pageNode!.id); // expand the page node itself
         return next;
       });
 
-      // Scroll to it
-      requestAnimationFrame(() => {
-        const el = containerRef.current?.querySelector(`[data-element-id="${pageNode.id}"]`);
-        el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      });
+      // Scroll to it (deferred so visibleRows/rowIndexById have updated)
+      requestAnimationFrame(() => scrollToNode(pageNode!.id));
     }
-  }, [currentPage, pageIndex, allFlat, parentMap, setSelectedElementId]);
+  }, [currentPage, pageIndex, allFlat, parentMap, setSelectedElementId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // React to inspector selection — find node by file offset and scroll to it
   const selectedElementOffset = useAfpViewerStore((s) => s.selectedElementOffset);
   useEffect(() => {
     if (selectedElementOffset === null || allFlat.length === 0) return;
 
+    let flat = allFlat;
+    let pMap = parentMap;
+
     // Find the tree node at this byte offset
-    const targetNode = allFlat.find((n) => n.offset === selectedElementOffset);
+    let targetNode = flat.find((n) => n.offset === selectedElementOffset);
+
+    // If not found, parse ahead to reach this offset
+    if (!targetNode) {
+      const result = parseUntilOffset(selectedElementOffset);
+      if (result) {
+        flat = result.flat;
+        pMap = result.pMap;
+        targetNode = flat.find((n) => n.offset === selectedElementOffset);
+      }
+    }
+
     if (!targetNode) return;
 
     setSelectedElementId(targetNode.id);
     setSelectedNode(targetNode);
 
     // Expand ancestors so the node is visible
-    const ancestors = getAncestorIds(parentMap, targetNode.id);
+    const ancestors = getAncestorIds(pMap, targetNode.id);
     setExpandedIds((prev) => {
       const next = new Set(prev);
       for (const a of ancestors) next.add(a);
@@ -661,14 +799,11 @@ export function ElementTree() {
     });
 
     // Scroll to it
-    requestAnimationFrame(() => {
-      const el = containerRef.current?.querySelector(`[data-element-id="${targetNode.id}"]`);
-      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    });
+    requestAnimationFrame(() => scrollToNode(targetNode!.id));
 
     // Clear the offset so it doesn't re-trigger
     useAfpViewerStore.getState().setSelectedElementOffset(null);
-  }, [selectedElementOffset, allFlat, parentMap, setSelectedElementId]);
+  }, [selectedElementOffset, allFlat, parentMap, setSelectedElementId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Debounced search logic — uses pre-computed _searchText for instant matching
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -732,11 +867,8 @@ export function ElementTree() {
     }
 
     // Scroll to the element in the tree
-    requestAnimationFrame(() => {
-      const el = containerRef.current?.querySelector(`[data-element-id="${match.id}"]`);
-      el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    });
-  }, [matchIndex, matchList, parentMap, setSelectedElementId]);
+    requestAnimationFrame(() => scrollToNode(match.id));
+  }, [matchIndex, matchList, parentMap, setSelectedElementId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleToggle = useCallback((id: string) => {
     setExpandedIds((prev) => {
@@ -751,6 +883,35 @@ export function ElementTree() {
     setSelectedElementId(node.id);
     setSelectedNode(node);
   }, [setSelectedElementId]);
+
+  // Virtualized flat list of visible rows
+  const showEndTags = useAfpViewerStore((s) => s.showEndTags);
+  const visibleRows = useMemo(
+    () => buildVisibleRows(tree, expandedIds, showEndTags),
+    [tree, expandedIds, showEndTags],
+  );
+
+  // Build a quick id→index map for scroll-to-node
+  const rowIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < visibleRows.length; i++) map.set(visibleRows[i].id, i);
+    return map;
+  }, [visibleRows]);
+
+  const virtualizer = useVirtualizer({
+    count: visibleRows.length + (parseDone ? 0 : 1), // +1 for loading indicator
+    getScrollElement: () => containerRef.current,
+    estimateSize: () => 28, // row height in px
+    overscan: 20,
+  });
+
+  // Helper: scroll to a node by id using the virtualizer
+  const scrollToNode = useCallback((nodeId: string) => {
+    const idx = rowIndexById.get(nodeId);
+    if (idx != null) {
+      virtualizer.scrollToIndex(idx, { align: 'center', behavior: 'smooth' });
+    }
+  }, [rowIndexById, virtualizer]);
 
   const goNextMatch = useCallback(() => {
     if (matchList.length === 0) return;
@@ -809,9 +970,14 @@ export function ElementTree() {
     document.body.style.userSelect = 'none';
   }, [panelWidth]);
 
-  if (tree.length === 0) return null;
+  const estimatedTotal = useMemo(() => {
+    const ps = parseStateRef.current;
+    if (parseDone || !ps || ps.totalParsed === 0 || !fileData) return loadedCount;
+    const avgBytes = ps.offset / ps.totalParsed;
+    return Math.round(fileData.byteLength / avgBytes);
+  }, [parseDone, loadedCount, fileData]);
 
-  const totalFields = tree.reduce((c, n) => c + 1 + countNodes(n), 0);
+  if (tree.length === 0) return null;
 
   return (
     <div className="relative flex h-full shrink-0 flex-col border-l border-[hsl(var(--border))] bg-[hsl(var(--card))]" style={{ width: `${panelWidth}px` }}>
@@ -827,7 +993,7 @@ export function ElementTree() {
           AFP Elements
         </span>
         <span className="ml-1 text-[10px] text-[hsl(var(--muted-foreground))]">
-          {totalFields}
+          {loadedCount.toLocaleString()}{!parseDone && ` / ~${estimatedTotal.toLocaleString()}…`}
         </span>
         <div className="ml-auto relative">
           <SettingsMenu />
@@ -864,19 +1030,42 @@ export function ElementTree() {
         )}
       </div>
 
-      {/* Tree */}
+      {/* Tree (virtualized) */}
       <div ref={containerRef} className="flex-1 overflow-auto">
-        {tree.map((node) => (
-          <TreeNodeRow
-            key={node.id}
-            node={node}
-            selectedId={selectedId}
-            matchIds={matchIds}
-            expandedIds={expandedIds}
-            onToggle={handleToggle}
-            onSelect={handleSelect}
-          />
-        ))}
+        <div style={{ height: `${virtualizer.getTotalSize()}px`, width: '100%', position: 'relative' }}>
+          {virtualizer.getVirtualItems().map((vRow) => {
+            // Loading indicator row (last virtual item when still loading)
+            if (vRow.index >= visibleRows.length) {
+              return (
+                <div
+                  key="__loading__"
+                  style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: `${vRow.size}px`, transform: `translateY(${vRow.start}px)` }}
+                  className="flex items-center justify-center gap-2 text-[10px] text-[hsl(var(--muted-foreground))]"
+                >
+                  <div className="h-3 w-3 animate-spin rounded-full border-2 border-[hsl(var(--primary))] border-t-transparent" />
+                  Loading more elements…
+                </div>
+              );
+            }
+            const node = visibleRows[vRow.index];
+            return (
+              <div
+                key={node.id}
+                style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: `${vRow.size}px`, transform: `translateY(${vRow.start}px)` }}
+              >
+                <FlatTreeRow
+                  node={node}
+                  isSelected={selectedId === node.id}
+                  isMatch={matchIds.has(node.id)}
+                  isExpanded={expandedIds.has(node.id)}
+                  hasChildren={node.children.length > 0}
+                  onToggle={handleToggle}
+                  onSelect={handleSelect}
+                />
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Details panel */}
