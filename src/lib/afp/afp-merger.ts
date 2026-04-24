@@ -28,10 +28,15 @@ export interface MergeResult {
 
 // ── Quick page count ────────────────────────────────────────────────────────
 
-/** Single-pass BPG counter. Very fast — only reads SF headers. */
+/**
+ * Single-pass page counter. Counts BPG records (standard pages).
+ * If none found, falls back to BDT count (multi-document files where
+ * each document = one logical page).
+ */
 export function quickPageCount(data: ArrayBuffer): number {
   const view = new DataView(data);
-  let count = 0;
+  let bpg = 0;
+  let bdt = 0;
   let offset = 0;
   const size = data.byteLength;
 
@@ -40,19 +45,17 @@ export function quickPageCount(data: ArrayBuffer): number {
     if (offset + 5 > size) break;
     const length = view.getUint16(offset + 1, false);
     if (length < 6 || length > 32766) { offset++; continue; }
-    // BPG = D3 A8 AD
-    if (
-      view.getUint8(offset + 3) === 0xD3 &&
-      view.getUint8(offset + 4) === 0xA8 &&
-      view.getUint8(offset + 5) === 0xAD
-    ) {
-      count++;
+    if (view.getUint8(offset + 3) === 0xD3) {
+      const b4 = view.getUint8(offset + 4);
+      const b5 = view.getUint8(offset + 5);
+      if (b4 === 0xA8 && b5 === 0xAD) bpg++;      // BPG
+      else if (b4 === 0xA8 && b5 === 0xA8) bdt++;  // BDT
     }
     const next = offset + 1 + length;
     if (next <= offset) break;
     offset = next;
   }
-  return count;
+  return bpg > 0 ? bpg : bdt;
 }
 
 // ── Mode 1: Concatenate ─────────────────────────────────────────────────────
