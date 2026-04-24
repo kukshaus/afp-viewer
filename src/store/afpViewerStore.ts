@@ -42,6 +42,8 @@ export interface AfpViewerState {
   exportOpen: boolean;
   splitOpen: boolean;
   mergeOpen: boolean;
+  pageEditMode: boolean;
+  selectedPages: Set<number>; // 1-based page numbers
 
   // Settings
   showEndTags: boolean;
@@ -121,6 +123,8 @@ const initialState = {
   exportOpen: false,
   splitOpen: false,
   mergeOpen: false,
+  pageEditMode: false,
+  selectedPages: new Set<number>(),
   showEndTags: false,
   showPlaceholders: true,
   docDividerTle: '' as string,

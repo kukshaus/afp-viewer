@@ -1,10 +1,12 @@
 'use client';
 
-import { useRef, useEffect, useMemo, useState } from 'react';
+import { useRef, useEffect, useMemo, useState, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useAfpViewer } from '@/hooks/useAfpViewer';
 import { useAfpViewerStore } from '@/store/afpViewerStore';
-import { FileText, FolderOpen } from 'lucide-react';
+import { reassembleAfp } from '@/lib/afp/afp-page-manager';
+import { downloadBlob } from '@/lib/afp/afp-cutter';
+import { FileText, FolderOpen, Trash2, Save, CheckSquare, ArrowUpDown, X } from 'lucide-react';
 
 interface DocGroup {
   label: string;
@@ -37,9 +39,14 @@ export function ThumbnailStrip() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const { currentPage, totalPages, goToPage } = useAfpViewer();
   const fileData = useAfpViewerStore((s) => s.fileData);
+  const fileName = useAfpViewerStore((s) => s.fileName);
   const pageIndex = useAfpViewerStore((s) => s.pageIndex);
   const docDividerTle = useAfpViewerStore((s) => s.docDividerTle);
+  const pageEditMode = useAfpViewerStore((s) => s.pageEditMode);
+  const selectedPages = useAfpViewerStore((s) => s.selectedPages);
   const [docGroups, setDocGroups] = useState<DocGroup[]>([]);
+  const [moveTarget, setMoveTarget] = useState<string>('');
+  const lastClickedRef = useRef<number | null>(null);
 
   // Compute document groups asynchronously (batched to avoid UI freeze)
   useEffect(() => {
@@ -61,11 +68,8 @@ export function ThumbnailStrip() {
 
       for (; p < batchEnd; p++) {
         const entry = pageIndex[p];
-        // Scan backwards from page start to find the BPG (which may precede the stored offset)
-        // TLEs can be between BPG and the first BRS within the page
         let scanStart = entry.byteOffset;
         const prevEnd = p > 0 ? pageIndex[p - 1].byteOffset + pageIndex[p - 1].byteLength : 0;
-        // Look up to 5000 bytes before the stored offset for TLEs
         scanStart = Math.max(scanStart - 5000, prevEnd);
         let off = scanStart;
         const end = entry.byteOffset + entry.byteLength;
@@ -79,50 +83,45 @@ export function ThumbnailStrip() {
             const dl = len - 8;
             let tp = off + 9;
             const tEnd = off + 9 + dl;
-            let key = '', value = '';
+            let tleKey = '';
+            let tleValue = '';
             while (tp + 4 < tEnd) {
               const tLen = view.getUint8(tp);
               const tId = view.getUint8(tp + 1);
               if (tLen < 2 || tp + tLen > tEnd) break;
-              if (tId === 0x02 && tLen > 4) key = decodeEbcdicKey(view, tp + 4, tLen - 4);
-              if (tId === 0x36 && tLen > 4) value = decodeEbcdicKey(view, tp + 4, tLen - 4);
+              if (tId === 0x02 && tLen > 4) tleKey = decodeEbcdicKey(view, tp + 4, tLen - 4);
+              if (tId === 0x36 && tLen > 4) tleValue = decodeEbcdicKey(view, tp + 4, tLen - 4);
               tp += tLen;
             }
-
-            if (key === docDividerTle) {
-              const label = value || 'Doc ' + (groups.length + 1);
-              if (label !== currentDocLabel) {
-                if (currentDocLabel && currentDocStart <= p) {
-                  groups.push({ label: currentDocLabel, startPage: currentDocStart, endPage: p });
-                }
-                currentDocLabel = label;
-                currentDocStart = p + 1;
+            if (tleKey === docDividerTle && tleValue) {
+              const pageNum = p + 1;
+              if (currentDocLabel && pageNum > currentDocStart) {
+                groups.push({ label: currentDocLabel, startPage: currentDocStart, endPage: pageNum - 1 });
               }
-              break; // found divider for this page
+              currentDocLabel = tleValue;
+              currentDocStart = pageNum;
             }
           }
 
-          const next = off + 1 + len;
+          const next = off + 1 + view.getUint16(off + 1, false);
           if (next <= off) break;
           off = next;
         }
       }
 
       if (p < pageIndex.length) {
-        setTimeout(processBatch, 0);
+        requestAnimationFrame(processBatch);
       } else {
         if (currentDocLabel) {
           groups.push({ label: currentDocLabel, startPage: currentDocStart, endPage: pageIndex.length });
         }
-        if (!cancelled) setDocGroups([...groups]);
+        setDocGroups(groups);
       }
     }
-
     processBatch();
     return () => { cancelled = true; };
   }, [docDividerTle, fileData, pageIndex]);
 
-  // Build flat list: doc headers + pages
   const items = useMemo(() => {
     if (docGroups.length === 0) {
       return Array.from({ length: totalPages }, (_, i) => ({
@@ -157,13 +156,145 @@ export function ThumbnailStrip() {
     }
   }, [currentPage, virtualizer, items]);
 
+  // ── Selection helpers ──────────────────────────────────────────────────
+
+  const togglePage = useCallback((pageNum: number, e: React.MouseEvent) => {
+    if (!pageEditMode) {
+      goToPage(pageNum);
+      return;
+    }
+
+    const prev = useAfpViewerStore.getState().selectedPages;
+
+    if (e.shiftKey && lastClickedRef.current !== null) {
+      // Range select
+      const from = Math.min(lastClickedRef.current, pageNum);
+      const to = Math.max(lastClickedRef.current, pageNum);
+      const next = new Set(prev);
+      for (let p = from; p <= to; p++) next.add(p);
+      useAfpViewerStore.setState({ selectedPages: next });
+    } else if (e.ctrlKey || e.metaKey) {
+      // Toggle single
+      const next = new Set(prev);
+      if (next.has(pageNum)) next.delete(pageNum);
+      else next.add(pageNum);
+      useAfpViewerStore.setState({ selectedPages: next });
+    } else {
+      // Single select (replace)
+      useAfpViewerStore.setState({ selectedPages: new Set([pageNum]) });
+    }
+    lastClickedRef.current = pageNum;
+    goToPage(pageNum);
+  }, [pageEditMode, goToPage]);
+
+  const selectAll = useCallback(() => {
+    const all = new Set<number>();
+    for (let i = 1; i <= totalPages; i++) all.add(i);
+    useAfpViewerStore.setState({ selectedPages: all });
+  }, [totalPages]);
+
+  const selectNone = useCallback(() => {
+    useAfpViewerStore.setState({ selectedPages: new Set() });
+  }, []);
+
+  const invertSelection = useCallback(() => {
+    const prev = useAfpViewerStore.getState().selectedPages;
+    const next = new Set<number>();
+    for (let i = 1; i <= totalPages; i++) {
+      if (!prev.has(i)) next.add(i);
+    }
+    useAfpViewerStore.setState({ selectedPages: next });
+  }, [totalPages]);
+
+  // Delete selected = keep everything except selected
+  const deleteSelected = useCallback(() => {
+    if (!fileData || !pageIndex.length || selectedPages.size === 0) return;
+    const keepOrder: number[] = [];
+    for (let i = 0; i < pageIndex.length; i++) {
+      if (!selectedPages.has(i + 1)) keepOrder.push(i);
+    }
+    if (keepOrder.length === 0) return;
+    const blob = reassembleAfp(fileData, pageIndex, keepOrder);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_edited.afp`);
+  }, [fileData, pageIndex, selectedPages, fileName]);
+
+  // Extract selected = keep only selected, in original order
+  const extractSelected = useCallback(() => {
+    if (!fileData || !pageIndex.length || selectedPages.size === 0) return;
+    const order = Array.from(selectedPages).sort((a, b) => a - b).map((p) => p - 1);
+    const blob = reassembleAfp(fileData, pageIndex, order);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_extracted.afp`);
+  }, [fileData, pageIndex, selectedPages, fileName]);
+
+  // Move selected pages to a specific position
+  const moveSelected = useCallback(() => {
+    if (!fileData || !pageIndex.length || selectedPages.size === 0) return;
+    const target = parseInt(moveTarget, 10);
+    if (isNaN(target) || target < 1 || target > totalPages) return;
+
+    // Build new order: all pages with selected ones removed, then inserted at target
+    const sel = Array.from(selectedPages).sort((a, b) => a - b).map((p) => p - 1);
+    const selSet = new Set(sel);
+    const remaining: number[] = [];
+    for (let i = 0; i < pageIndex.length; i++) {
+      if (!selSet.has(i)) remaining.push(i);
+    }
+    // Insert at position (target-1, clamped)
+    const insertAt = Math.min(target - 1, remaining.length);
+    remaining.splice(insertAt, 0, ...sel);
+
+    const blob = reassembleAfp(fileData, pageIndex, remaining);
+    const stem = (fileName || 'document').replace(/\.afp$/i, '');
+    downloadBlob(blob, `${stem}_reordered.afp`);
+  }, [fileData, pageIndex, selectedPages, moveTarget, totalPages, fileName]);
+
+  const toggleEditMode = useCallback(() => {
+    const next = !pageEditMode;
+    useAfpViewerStore.setState({
+      pageEditMode: next,
+      selectedPages: next ? new Set<number>() : new Set<number>(),
+    });
+  }, [pageEditMode]);
+
   return (
     <div className="flex h-full w-48 shrink-0 flex-col border-r border-[hsl(var(--border))] bg-[hsl(var(--card))]">
-      {docGroups.length > 0 && (
-        <div className="shrink-0 border-b border-[hsl(var(--border))] px-3 py-1.5">
+      {/* Header bar */}
+      <div className="flex shrink-0 items-center justify-between border-b border-[hsl(var(--border))] px-2 py-1.5">
+        {docGroups.length > 0 ? (
           <span className="text-[10px] text-[hsl(var(--muted-foreground))]">{docGroups.length} Documents</span>
+        ) : (
+          <span className="text-[10px] text-[hsl(var(--muted-foreground))]">{totalPages} Pages</span>
+        )}
+        <button
+          onClick={toggleEditMode}
+          className={`rounded p-1 transition-colors ${
+            pageEditMode
+              ? 'bg-[hsl(var(--primary))]/15 text-[hsl(var(--primary))]'
+              : 'text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))]'
+          }`}
+          title={pageEditMode ? 'Exit page edit mode' : 'Page edit mode'}
+        >
+          {pageEditMode ? <X className="h-3.5 w-3.5" /> : <CheckSquare className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+
+      {/* Selection toolbar */}
+      {pageEditMode && (
+        <div className="shrink-0 border-b border-[hsl(var(--border))] px-2 py-1 space-y-1">
+          <div className="flex items-center gap-1 text-[10px]">
+            <button onClick={selectAll} className="rounded px-1.5 py-0.5 hover:bg-[hsl(var(--accent))] text-[hsl(var(--muted-foreground))]">All</button>
+            <button onClick={selectNone} className="rounded px-1.5 py-0.5 hover:bg-[hsl(var(--accent))] text-[hsl(var(--muted-foreground))]">None</button>
+            <button onClick={invertSelection} className="rounded px-1.5 py-0.5 hover:bg-[hsl(var(--accent))] text-[hsl(var(--muted-foreground))]">Invert</button>
+            <span className="ml-auto font-medium text-[hsl(var(--primary))]">
+              {selectedPages.size > 0 ? `${selectedPages.size} sel.` : ''}
+            </span>
+          </div>
         </div>
       )}
+
+      {/* Thumbnail list */}
       <div ref={scrollContainerRef} className="flex-1 overflow-auto">
         <div
           style={{
@@ -192,17 +323,29 @@ export function ThumbnailStrip() {
             }
 
             const isActive = item.pageNum === currentPage;
+            const isSelected = selectedPages.has(item.pageNum);
             return (
               <button
                 key={item.pageNum}
-                onClick={() => goToPage(item.pageNum)}
-                className={`absolute left-0 right-0 flex items-center gap-3 px-3 py-2 text-left transition-colors ${
-                  isActive
-                    ? 'bg-[hsl(var(--primary))]/10 text-[hsl(var(--primary))]'
-                    : 'hover:bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]'
+                onClick={(e) => togglePage(item.pageNum, e)}
+                className={`absolute left-0 right-0 flex items-center gap-2 px-2 py-2 text-left transition-colors ${
+                  isSelected
+                    ? 'bg-[hsl(var(--primary))]/15 ring-1 ring-inset ring-[hsl(var(--primary))]'
+                    : isActive
+                      ? 'bg-[hsl(var(--primary))]/10 text-[hsl(var(--primary))]'
+                      : 'hover:bg-[hsl(var(--accent))] text-[hsl(var(--foreground))]'
                 }`}
                 style={{ top: `${vItem.start}px`, height: `${vItem.size}px` }}
               >
+                {pageEditMode && (
+                  <span className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border text-[10px] ${
+                    isSelected
+                      ? 'border-[hsl(var(--primary))] bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))]'
+                      : 'border-[hsl(var(--border))]'
+                  }`}>
+                    {isSelected ? '✓' : ''}
+                  </span>
+                )}
                 <FileText className={`h-4 w-4 shrink-0 ${isActive ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`} />
                 <span className={`text-sm font-medium ${isActive ? 'text-[hsl(var(--primary))]' : ''}`}>
                   Page {item.pageNum}
@@ -212,6 +355,53 @@ export function ThumbnailStrip() {
           })}
         </div>
       </div>
+
+      {/* Action bar — visible when pages are selected */}
+      {pageEditMode && selectedPages.size > 0 && (
+        <div className="shrink-0 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))] px-2 py-2 space-y-1.5">
+          <p className="text-[10px] font-medium text-[hsl(var(--foreground))]">
+            {selectedPages.size} of {totalPages} pages selected
+          </p>
+
+          <div className="flex gap-1">
+            <button
+              onClick={deleteSelected}
+              className="flex flex-1 items-center justify-center gap-1 rounded bg-[hsl(var(--destructive))] px-2 py-1 text-[10px] font-medium text-white hover:opacity-90"
+              title="Download document without selected pages"
+            >
+              <Trash2 className="h-3 w-3" /> Remove
+            </button>
+            <button
+              onClick={extractSelected}
+              className="flex flex-1 items-center justify-center gap-1 rounded bg-[hsl(var(--primary))] px-2 py-1 text-[10px] font-medium text-[hsl(var(--primary-foreground))] hover:opacity-90"
+              title="Download only selected pages as new AFP"
+            >
+              <Save className="h-3 w-3" /> Extract
+            </button>
+          </div>
+
+          {/* Move to position */}
+          <div className="flex items-center gap-1">
+            <ArrowUpDown className="h-3 w-3 shrink-0 text-[hsl(var(--muted-foreground))]" />
+            <input
+              type="number"
+              min={1}
+              max={totalPages}
+              value={moveTarget}
+              onChange={(e) => setMoveTarget(e.target.value)}
+              placeholder="Move to pos."
+              className="h-6 w-20 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-1.5 text-[10px] text-[hsl(var(--foreground))] placeholder:text-[hsl(var(--muted-foreground))] focus:outline-none focus:ring-1 focus:ring-[hsl(var(--primary))]"
+            />
+            <button
+              onClick={moveSelected}
+              disabled={!moveTarget}
+              className="rounded bg-[hsl(var(--accent))] px-2 py-1 text-[10px] font-medium text-[hsl(var(--foreground))] hover:opacity-90 disabled:opacity-40"
+            >
+              Move
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
