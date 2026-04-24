@@ -15,6 +15,7 @@ import { DiagnosticsPanel } from './DiagnosticsPanel';
 import { DocumentInfo } from './DocumentInfo';
 import { ExportDialog } from './ExportDialog';
 import { SplitDialog } from './SplitDialog';
+import { MergeDialog } from './MergeDialog';
 import { AlertCircle } from 'lucide-react';
 
 export function AfpViewer() {
@@ -174,6 +175,7 @@ export function AfpViewer() {
       <DocumentInfo />
       <ExportDialog />
       <SplitDialog />
+      <MergeDialog />
     </div>
   );
 }
