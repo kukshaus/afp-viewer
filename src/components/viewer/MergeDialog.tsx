@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { useAfpViewerStore } from '@/store/afpViewerStore';
 import { concatAfp, mergeAfpSingleDocument, quickPageCount } from '@/lib/afp/afp-merger';
 import type { MergeFileEntry } from '@/lib/afp/afp-merger';
@@ -33,26 +33,27 @@ export function MergeDialog() {
   const [resultInfo, setResultInfo] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Seed with currently open file when dialog opens and list is empty
-  const seeded = useRef(false);
-  if (mergeOpen && !seeded.current && files.length === 0 && currentFileData && currentFileName) {
-    seeded.current = true;
-    setFiles([{
-      id: `f-${nextId++}`,
-      name: currentFileName,
-      data: currentFileData,
-      size: currentFileData.byteLength,
-      pageCount: currentPageIndex.length || quickPageCount(currentFileData),
-    }]);
-  }
+  // Seed with currently open file when dialog opens
+  useEffect(() => {
+    if (mergeOpen && currentFileData && currentFileName) {
+      setFiles([{
+        id: `f-${nextId++}`,
+        name: currentFileName,
+        data: currentFileData,
+        size: currentFileData.byteLength,
+        pageCount: currentPageIndex.length || quickPageCount(currentFileData),
+      }]);
+    }
+    if (!mergeOpen) {
+      setFiles([]);
+      setStatus('idle');
+      setError('');
+      setResultInfo('');
+    }
+  }, [mergeOpen]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const close = useCallback(() => {
     useAfpViewerStore.setState({ mergeOpen: false });
-    setStatus('idle');
-    setError('');
-    setResultInfo('');
-    setFiles([]);
-    seeded.current = false;
   }, []);
 
   const addFiles = useCallback(async (fileList: FileList) => {
@@ -240,12 +241,15 @@ export function MergeDialog() {
           <input
             ref={fileInputRef}
             type="file"
-            accept=".afp,.AFP"
+            accept=".afp,.AFP,.afp2"
             multiple
             className="hidden"
             onChange={(e) => {
-              if (e.target.files?.length) addFiles(e.target.files);
-              e.target.value = '';
+              if (e.target.files && e.target.files.length > 0) {
+                addFiles(e.target.files);
+              }
+              // Reset so the same file(s) can be picked again
+              if (fileInputRef.current) fileInputRef.current.value = '';
             }}
           />
 
